@@ -28,6 +28,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -46,7 +47,7 @@ import (
 const (
 	softResponseLimit = 2 * 1024 * 1024 // Target maximum size of returned blocks, headers or node data.
 	estHeaderRlpSize  = 500             // Approximate size of an RLP encoded block header
-	ethVersion        = 63              // equivalent eth version for the downloader
+	ethVersion        = 64              // equivalent eth version for the downloader
 
 	MaxHeaderFetch           = 192 // Amount of block headers to be fetched per retrieval request
 	MaxBodyFetch             = 32  // Amount of block bodies to be fetched per retrieval request
@@ -66,6 +67,7 @@ var (
 // serverHandler is responsible for serving light client and process
 // all incoming light requests.
 type serverHandler struct {
+	forkFilter forkid.Filter
 	blockchain *core.BlockChain
 	chainDb    ethdb.Database
 	txpool     *core.TxPool
@@ -81,6 +83,7 @@ type serverHandler struct {
 
 func newServerHandler(server *LesServer, blockchain *core.BlockChain, chainDb ethdb.Database, txpool *core.TxPool, synced func() bool) *serverHandler {
 	handler := &serverHandler{
+		forkFilter: forkid.NewFilter(blockchain),
 		server:     server,
 		blockchain: blockchain,
 		chainDb:    chainDb,
@@ -121,16 +124,13 @@ func (h *serverHandler) handle(p *clientPeer) error {
 		hash   = head.Hash()
 		number = head.Number.Uint64()
 		td     = h.blockchain.GetTd(hash, number)
+		forkID = forkid.NewID(h.blockchain.Config(), h.blockchain.Genesis().Hash(), h.blockchain.CurrentBlock().NumberU64())
 	)
-	if err := p.Handshake(td, hash, number, h.blockchain.Genesis().Hash(), h.server); err != nil {
+	if err := p.Handshake(td, hash, number, h.blockchain.Genesis().Hash(), forkID, h.forkFilter, h.server); err != nil {
 		p.Log().Debug("Light Ethereum handshake failed", "err", err)
 		return err
 	}
-	// Reject light clients if server is not synced.
-	if !h.synced() {
-		p.Log().Debug("Light server not synced, rejecting peer")
-		return p2p.DiscRequested
-	}
+	// Reject the duplicated peer, otherwise register it to peerset.
 	var registered bool
 	if err := h.server.ns.Operation(func() {
 		if h.server.ns.GetField(p.Node(), clientPeerField) != nil {
@@ -156,7 +156,14 @@ func (h *serverHandler) handle(p *clientPeer) error {
 		_, err := p.rw.ReadMsg()
 		return err
 	}
-
+	// Reject light clients if server is not synced.
+	//
+	// Put this checking here, so that "non-synced" les-server peers are still allowed
+	// to keep the connection.
+	if !h.synced() {
+		p.Log().Debug("Light server not synced, rejecting peer")
+		return p2p.DiscRequested
+	}
 	// Disconnect the inbound peer if it's rejected by clientPool
 	if cap, err := h.server.clientPool.connect(p); cap != p.fcParams.MinRecharge || err != nil {
 		p.Log().Debug("Light Ethereum peer rejected", "err", errFullClientPool)
@@ -348,7 +355,6 @@ func (h *serverHandler) handleMsg(p *clientPeer, wg *sync.WaitGroup) error {
 						origin = h.blockchain.GetHeaderByNumber(query.Origin.Number)
 					}
 					if origin == nil {
-						p.bumpInvalid()
 						break
 					}
 					headers = append(headers, origin)
@@ -608,6 +614,7 @@ func (h *serverHandler) handleMsg(p *clientPeer, wg *sync.WaitGroup) error {
 		var (
 			lastBHash common.Hash
 			root      common.Hash
+			header    *types.Header
 		)
 		reqCnt := len(req.Reqs)
 		if accept(req.ReqID, uint64(reqCnt), MaxProofsFetch) {
@@ -622,10 +629,6 @@ func (h *serverHandler) handleMsg(p *clientPeer, wg *sync.WaitGroup) error {
 						return
 					}
 					// Look up the root hash belonging to the request
-					var (
-						header *types.Header
-						trie   state.Trie
-					)
 					if request.BHash != lastBHash {
 						root, lastBHash = common.Hash{}, request.BHash
 
@@ -652,6 +655,7 @@ func (h *serverHandler) handleMsg(p *clientPeer, wg *sync.WaitGroup) error {
 					// Open the account or storage trie for the request
 					statedb := h.blockchain.StateCache()
 
+					var trie state.Trie
 					switch len(request.AccKey) {
 					case 0:
 						// No account key specified, open an account trie
@@ -1006,18 +1010,24 @@ func (b *broadcaster) sendTo(node *enode.Node) {
 	}
 	if p, _ := b.ns.GetField(node, clientPeerField).(*clientPeer); p != nil {
 		if p.headInfo.Td == nil || b.lastAnnounce.Td.Cmp(p.headInfo.Td) > 0 {
+			announce := b.lastAnnounce
 			switch p.announceType {
 			case announceTypeSimple:
-				if !p.queueSend(func() { p.sendAnnounce(b.lastAnnounce) }) {
-					log.Debug("Drop announcement because queue is full", "number", b.lastAnnounce.Number, "hash", b.lastAnnounce.Hash)
+				if !p.queueSend(func() { p.sendAnnounce(announce) }) {
+					log.Debug("Drop announcement because queue is full", "number", announce.Number, "hash", announce.Hash)
+				} else {
+					log.Debug("Sent announcement", "number", announce.Number, "hash", announce.Hash)
 				}
 			case announceTypeSigned:
 				if b.signedAnnounce.Hash != b.lastAnnounce.Hash {
 					b.signedAnnounce = b.lastAnnounce
 					b.signedAnnounce.sign(b.privateKey)
 				}
-				if !p.queueSend(func() { p.sendAnnounce(b.signedAnnounce) }) {
-					log.Debug("Drop announcement because queue is full", "number", b.lastAnnounce.Number, "hash", b.lastAnnounce.Hash)
+				announce := b.signedAnnounce
+				if !p.queueSend(func() { p.sendAnnounce(announce) }) {
+					log.Debug("Drop announcement because queue is full", "number", announce.Number, "hash", announce.Hash)
+				} else {
+					log.Debug("Sent announcement", "number", announce.Number, "hash", announce.Hash)
 				}
 			}
 			p.headInfo = blockInfo{b.lastAnnounce.Hash, b.lastAnnounce.Number, b.lastAnnounce.Td}
