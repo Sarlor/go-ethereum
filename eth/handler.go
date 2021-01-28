@@ -250,9 +250,20 @@ func (h *handler) runEthPeer(peer *eth.Peer, handler eth.Handler) error {
 		peer.Log().Debug("Ethereum handshake failed", "err", err)
 		return err
 	}
+	reject := false // reserved peer slots
+	if atomic.LoadUint32(&h.snapSync) == 1 && !peer.SupportsCap("snap", 1) {
+		// If we are running snap-sync, we want to reserve roughly half the peer
+		// slots for peers supporting the snap protocol.
+		// The logic here is; we only allow up to 5 more non-snap peers than snap-peers.
+		if all, snp := h.peers.Len(), h.peers.SnapLen(); all-snp > snp+5 {
+			reject = true
+		}
+	}
 	// Ignore maxPeers if this is a trusted peer
-	if h.peers.Len() >= h.maxPeers && !peer.Peer.Info().Network.Trusted {
-		return p2p.DiscTooManyPeers
+	if !peer.Peer.Info().Network.Trusted {
+		if reject || h.peers.Len() >= h.maxPeers {
+			return p2p.DiscTooManyPeers
+		}
 	}
 	peer.Log().Debug("Ethereum peer connected", "name", peer.Name())
 
@@ -326,24 +337,32 @@ func (h *handler) runSnapPeer(peer *snap.Peer, handler snap.Handler) error {
 }
 
 func (h *handler) removePeer(id string) {
+	// Create a custom logger to avoid printing the entire id
+	var logger log.Logger
+	if len(id) < 16 {
+		// Tests use short IDs, don't choke on them
+		logger = log.New("peer", id)
+	} else {
+		logger = log.New("peer", id[:8])
+	}
 	// Remove the eth peer if it exists
 	eth := h.peers.ethPeer(id)
 	if eth != nil {
-		log.Debug("Removing Ethereum peer", "peer", id)
+		logger.Debug("Removing Ethereum peer")
 		h.downloader.UnregisterPeer(id)
 		h.txFetcher.Drop(id)
 
 		if err := h.peers.unregisterEthPeer(id); err != nil {
-			log.Error("Peer removal failed", "peer", id, "err", err)
+			logger.Error("Ethereum peer removal failed", "err", err)
 		}
 	}
 	// Remove the snap peer if it exists
 	snap := h.peers.snapPeer(id)
 	if snap != nil {
-		log.Debug("Removing Snapshot peer", "peer", id)
+		logger.Debug("Removing Snapshot peer")
 		h.downloader.SnapSyncer.Unregister(id)
 		if err := h.peers.unregisterSnapPeer(id); err != nil {
-			log.Error("Peer removal failed", "peer", id, "err", err)
+			logger.Error("Snapshot peer removel failed", "err", err)
 		}
 	}
 	// Hard disconnect at the networking layer
@@ -437,14 +456,14 @@ func (h *handler) BroadcastTransactions(txs types.Transactions, propagate bool) 
 	// Broadcast transactions to a batch of peers not knowing about it
 	if propagate {
 		for _, tx := range txs {
-			peers := h.peers.ethPeersWithoutTransacion(tx.Hash())
+			peers := h.peers.ethPeersWithoutTransaction(tx.Hash())
 
 			// Send the block to a subset of our peers
 			transfer := peers[:int(math.Sqrt(float64(len(peers))))]
 			for _, peer := range transfer {
 				txset[peer] = append(txset[peer], tx.Hash())
 			}
-			log.Trace("Broadcast transaction", "hash", tx.Hash(), "recipients", len(peers))
+			log.Trace("Broadcast transaction", "hash", tx.Hash(), "recipients", len(transfer))
 		}
 		for peer, hashes := range txset {
 			peer.AsyncSendTransactions(hashes)
@@ -453,7 +472,7 @@ func (h *handler) BroadcastTransactions(txs types.Transactions, propagate bool) 
 	}
 	// Otherwise only broadcast the announcement to peers
 	for _, tx := range txs {
-		peers := h.peers.ethPeersWithoutTransacion(tx.Hash())
+		peers := h.peers.ethPeersWithoutTransaction(tx.Hash())
 		for _, peer := range peers {
 			annos[peer] = append(annos[peer], tx.Hash())
 		}

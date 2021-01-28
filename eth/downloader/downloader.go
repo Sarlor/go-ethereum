@@ -89,7 +89,8 @@ var (
 	errCancelContentProcessing = errors.New("content processing canceled (requested)")
 	errCanceled                = errors.New("syncing canceled (requested)")
 	errNoSyncActive            = errors.New("no sync active")
-	errTooOld                  = errors.New("peer doesn't speak recent enough protocol version (need version >= 64)")
+	errTooOld                  = errors.New("peer's protocol version too old")
+	errNoAncestorFound         = errors.New("no common ancestor found")
 )
 
 type Downloader struct {
@@ -297,7 +298,7 @@ func (d *Downloader) RegisterPeer(id string, version uint, peer Peer) error {
 		// Tests use short IDs, don't choke on them
 		logger = log.New("peer", id)
 	} else {
-		logger = log.New("peer", id[:16])
+		logger = log.New("peer", id[:8])
 	}
 	logger.Trace("Registering sync peer")
 	if err := d.peers.Register(newPeerConnection(id, version, peer, logger)); err != nil {
@@ -324,7 +325,7 @@ func (d *Downloader) UnregisterPeer(id string) error {
 		// Tests use short IDs, don't choke on them
 		logger = log.New("peer", id)
 	} else {
-		logger = log.New("peer", id[:16])
+		logger = log.New("peer", id[:8])
 	}
 	logger.Trace("Unregistering sync peer")
 	if err := d.peers.Unregister(id); err != nil {
@@ -460,7 +461,7 @@ func (d *Downloader) syncWithPeer(p *peerConnection, hash common.Hash, td *big.I
 		}
 	}()
 	if p.version < 64 {
-		return fmt.Errorf("%w, peer version: %d", errTooOld, p.version)
+		return fmt.Errorf("%w: advertized %d < required %d", errTooOld, p.version, 64)
 	}
 	mode := d.getMode()
 
@@ -814,6 +815,26 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 		}
 	}
 
+	ancestor, err := d.findAncestorSpanSearch(p, mode, remoteHeight, localHeight, floor)
+	if err == nil {
+		return ancestor, nil
+	}
+	// The returned error was not nil.
+	// If the error returned does not reflect that a common ancestor was not found, return it.
+	// If the error reflects that a common ancestor was not found, continue to binary search,
+	// where the error value will be reassigned.
+	if !errors.Is(err, errNoAncestorFound) {
+		return 0, err
+	}
+
+	ancestor, err = d.findAncestorBinarySearch(p, mode, remoteHeight, floor)
+	if err != nil {
+		return 0, err
+	}
+	return ancestor, nil
+}
+
+func (d *Downloader) findAncestorSpanSearch(p *peerConnection, mode SyncMode, remoteHeight, localHeight uint64, floor int64) (commonAncestor uint64, err error) {
 	from, count, skip, max := calculateRequestSpan(remoteHeight, localHeight)
 
 	p.log.Trace("Span searching for common ancestor", "count", count, "from", from, "skip", skip)
@@ -894,6 +915,12 @@ func (d *Downloader) findAncestor(p *peerConnection, remoteHeader *types.Header)
 		p.log.Debug("Found common ancestor", "number", number, "hash", hash)
 		return number, nil
 	}
+	return 0, errNoAncestorFound
+}
+
+func (d *Downloader) findAncestorBinarySearch(p *peerConnection, mode SyncMode, remoteHeight uint64, floor int64) (commonAncestor uint64, err error) {
+	hash := common.Hash{}
+
 	// Ancestor not found, we need to binary search over our chain
 	start, end := uint64(0), remoteHeight
 	if floor > 0 {

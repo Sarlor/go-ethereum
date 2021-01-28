@@ -45,6 +45,7 @@ import (
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
+	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/ethstats"
 	"github.com/ethereum/go-ethereum/graphql"
@@ -58,7 +59,6 @@ import (
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/p2p"
-	"github.com/ethereum/go-ethereum/p2p/discv5"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/nat"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
@@ -112,6 +112,10 @@ var (
 	AncientFlag = DirectoryFlag{
 		Name:  "datadir.ancient",
 		Usage: "Data directory for ancient chain segments (default = inside chaindata)",
+	}
+	MinFreeDiskSpaceFlag = DirectoryFlag{
+		Name:  "datadir.minfreedisk",
+		Usage: "Minimum free disk space in MB, once reached triggers auto shut down (default = --cache.gc converted to MB, 0 = disabled)",
 	}
 	KeyStoreDirFlag = DirectoryFlag{
 		Name:  "keystore",
@@ -684,12 +688,12 @@ var (
 	MetricsHTTPFlag = cli.StringFlag{
 		Name:  "metrics.addr",
 		Usage: "Enable stand-alone metrics HTTP server listening interface",
-		Value: "127.0.0.1",
+		Value: metrics.DefaultConfig.HTTP,
 	}
 	MetricsPortFlag = cli.IntFlag{
 		Name:  "metrics.port",
 		Usage: "Metrics HTTP server listening port",
-		Value: 6060,
+		Value: metrics.DefaultConfig.Port,
 	}
 	MetricsEnableInfluxDBFlag = cli.BoolFlag{
 		Name:  "metrics.influxdb",
@@ -698,22 +702,22 @@ var (
 	MetricsInfluxDBEndpointFlag = cli.StringFlag{
 		Name:  "metrics.influxdb.endpoint",
 		Usage: "InfluxDB API endpoint to report metrics to",
-		Value: "http://localhost:8086",
+		Value: metrics.DefaultConfig.InfluxDBEndpoint,
 	}
 	MetricsInfluxDBDatabaseFlag = cli.StringFlag{
 		Name:  "metrics.influxdb.database",
 		Usage: "InfluxDB database name to push reported metrics to",
-		Value: "geth",
+		Value: metrics.DefaultConfig.InfluxDBDatabase,
 	}
 	MetricsInfluxDBUsernameFlag = cli.StringFlag{
 		Name:  "metrics.influxdb.username",
 		Usage: "Username to authorize access to the database",
-		Value: "test",
+		Value: metrics.DefaultConfig.InfluxDBUsername,
 	}
 	MetricsInfluxDBPasswordFlag = cli.StringFlag{
 		Name:  "metrics.influxdb.password",
 		Usage: "Password to authorize access to the database",
-		Value: "test",
+		Value: metrics.DefaultConfig.InfluxDBPassword,
 	}
 	// Tags are part of every measurement sent to InfluxDB. Queries on tags are faster in InfluxDB.
 	// For example `host` tag could be used so that we can group all nodes and average a measurement
@@ -722,7 +726,7 @@ var (
 	MetricsInfluxDBTagsFlag = cli.StringFlag{
 		Name:  "metrics.influxdb.tags",
 		Usage: "Comma-separated InfluxDB tags (key/values) attached to all measurements",
-		Value: "host=localhost",
+		Value: metrics.DefaultConfig.InfluxDBTags,
 	}
 	EWASMInterpreterFlag = cli.StringFlag{
 		Name:  "vm.ewasm",
@@ -837,7 +841,7 @@ func setBootstrapNodes(ctx *cli.Context, cfg *p2p.Config) {
 // setBootstrapNodesV5 creates a list of bootstrap nodes from the command line
 // flags, reverting to pre-configured ones if none have been specified.
 func setBootstrapNodesV5(ctx *cli.Context, cfg *p2p.Config) {
-	urls := params.MainnetBootnodes
+	urls := params.V5Bootnodes
 	switch {
 	case ctx.GlobalIsSet(BootnodesFlag.Name) || ctx.GlobalIsSet(LegacyBootnodesV5Flag.Name):
 		if ctx.GlobalIsSet(LegacyBootnodesV5Flag.Name) {
@@ -845,22 +849,14 @@ func setBootstrapNodesV5(ctx *cli.Context, cfg *p2p.Config) {
 		} else {
 			urls = SplitAndTrim(ctx.GlobalString(BootnodesFlag.Name))
 		}
-	case ctx.GlobalBool(RopstenFlag.Name):
-		urls = params.RopstenBootnodes
-	case ctx.GlobalBool(RinkebyFlag.Name):
-		urls = params.RinkebyBootnodes
-	case ctx.GlobalBool(GoerliFlag.Name):
-		urls = params.GoerliBootnodes
-	case ctx.GlobalBool(YoloV2Flag.Name):
-		urls = params.YoloV2Bootnodes
 	case cfg.BootstrapNodesV5 != nil:
 		return // already set, don't apply defaults.
 	}
 
-	cfg.BootstrapNodesV5 = make([]*discv5.Node, 0, len(urls))
+	cfg.BootstrapNodesV5 = make([]*enode.Node, 0, len(urls))
 	for _, url := range urls {
 		if url != "" {
-			node, err := discv5.ParseNode(url)
+			node, err := enode.Parse(enode.ValidSchemes, url)
 			if err != nil {
 				log.Error("Bootstrap URL invalid", "enode", url, "err", err)
 				continue
@@ -1233,11 +1229,11 @@ func SetNodeConfig(ctx *cli.Context, cfg *node.Config) {
 	if ctx.GlobalIsSet(LightKDFFlag.Name) {
 		cfg.UseLightweightKDF = ctx.GlobalBool(LightKDFFlag.Name)
 	}
-	if ctx.GlobalIsSet(USBFlag.Name) {
-		cfg.NoUSB = !ctx.GlobalBool(USBFlag.Name)
-	}
-	if ctx.GlobalIsSet(NoUSBFlag.Name) {
+	if ctx.GlobalIsSet(NoUSBFlag.Name) || cfg.NoUSB {
 		log.Warn("Option nousb is deprecated and USB is deactivated by default. Use --usb to enable")
+	}
+	if ctx.GlobalIsSet(USBFlag.Name) {
+		cfg.USB = ctx.GlobalBool(USBFlag.Name)
 	}
 	if ctx.GlobalIsSet(InsecureUnlockAllowedFlag.Name) {
 		cfg.InsecureUnlockAllowed = ctx.GlobalBool(InsecureUnlockAllowedFlag.Name)
@@ -1568,7 +1564,6 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *eth.Config) {
 		// If snap-sync is requested, this flag is also required
 		if cfg.SyncMode == downloader.SnapSync {
 			log.Info("Snap sync requested, enabling --snapshot")
-			ctx.Set(SnapshotFlag.Name, "true")
 		} else {
 			cfg.TrieCleanCache += cfg.SnapshotCache
 			cfg.SnapshotCache = 0 // Disabled
@@ -1721,6 +1716,7 @@ func RegisterEthService(stack *node.Node, cfg *eth.Config) ethapi.Backend {
 		if err != nil {
 			Fatalf("Failed to register the Ethereum service: %v", err)
 		}
+		stack.RegisterAPIs(tracers.APIs(backend.ApiBackend))
 		return backend.ApiBackend
 	}
 	backend, err := eth.New(stack, cfg)
@@ -1733,6 +1729,7 @@ func RegisterEthService(stack *node.Node, cfg *eth.Config) ethapi.Backend {
 			Fatalf("Failed to create the LES server: %v", err)
 		}
 	}
+	stack.RegisterAPIs(tracers.APIs(backend.APIBackend))
 	return backend.APIBackend
 }
 
@@ -1909,9 +1906,8 @@ func MakeConsolePreloads(ctx *cli.Context) []string {
 	// Otherwise resolve absolute paths and return them
 	var preloads []string
 
-	assets := ctx.GlobalString(JSpathFlag.Name)
 	for _, file := range strings.Split(ctx.GlobalString(PreloadJSFlag.Name), ",") {
-		preloads = append(preloads, common.AbsolutePath(assets, strings.TrimSpace(file)))
+		preloads = append(preloads, strings.TrimSpace(file))
 	}
 	return preloads
 }

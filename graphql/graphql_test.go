@@ -33,7 +33,14 @@ import (
 )
 
 func TestBuildSchema(t *testing.T) {
-	stack, err := node.New(&node.DefaultConfig)
+	ddir, err := ioutil.TempDir("", "graphql-buildschema")
+	if err != nil {
+		t.Fatalf("failed to create temporary datadir: %v", err)
+	}
+	// Copy config
+	conf := node.DefaultConfig
+	conf.DataDir = ddir
+	stack, err := node.New(&conf)
 	if err != nil {
 		t.Fatalf("could not create new node: %v", err)
 	}
@@ -117,8 +124,20 @@ func TestGraphQLBlockSerialization(t *testing.T) {
 			want: `{"errors":[{"message":"Cannot query field \"bleh\" on type \"Query\".","locations":[{"line":1,"column":2}]}]}`,
 			code: 400,
 		},
+		// should return `estimateGas` as decimal
+		{
+			body: `{"query": "{block{ estimateGas(data:{}) }}"}`,
+			want: `{"data":{"block":{"estimateGas":53000}}}`,
+			code: 200,
+		},
+		// should return `status` as decimal
+		{
+			body: `{"query": "{block {number call (data : {from : \"0xa94f5374fce5edbc8e2a8697c15331677e6ebf0b\", to: \"0x6295ee1b4f6dd65047762f924ecd367c17eabf8f\", data :\"0x12a7b914\"}){data status}}}"}`,
+			want: `{"data":{"block":{"number":10,"call":{"data":"0x","status":1}}}}`,
+			code: 200,
+		},
 	} {
-		resp, err := http.Post(fmt.Sprintf("http://%s/graphql", "127.0.0.1:9393"), "application/json", strings.NewReader(tt.body))
+		resp, err := http.Post(fmt.Sprintf("%s/graphql", stack.HTTPEndpoint()), "application/json", strings.NewReader(tt.body))
 		if err != nil {
 			t.Fatalf("could not post: %v", err)
 		}
@@ -143,7 +162,7 @@ func TestGraphQLHTTPOnSamePort_GQLRequest_Unsuccessful(t *testing.T) {
 		t.Fatalf("could not start node: %v", err)
 	}
 	body := strings.NewReader(`{"query": "{block{number}}","variables": null}`)
-	resp, err := http.Post(fmt.Sprintf("http://%s/graphql", "127.0.0.1:9393"), "application/json", body)
+	resp, err := http.Post(fmt.Sprintf("%s/graphql", stack.HTTPEndpoint()), "application/json", body)
 	if err != nil {
 		t.Fatalf("could not post: %v", err)
 	}
@@ -151,6 +170,7 @@ func TestGraphQLHTTPOnSamePort_GQLRequest_Unsuccessful(t *testing.T) {
 	if err != nil {
 		t.Fatalf("could not read from response body: %v", err)
 	}
+	resp.Body.Close()
 	// make sure the request is not handled successfully
 	if want, have := "404 page not found\n", string(bodyBytes); have != want {
 		t.Errorf("have:\n%v\nwant:\n%v", have, want)
@@ -163,9 +183,9 @@ func TestGraphQLHTTPOnSamePort_GQLRequest_Unsuccessful(t *testing.T) {
 func createNode(t *testing.T, gqlEnabled bool) *node.Node {
 	stack, err := node.New(&node.Config{
 		HTTPHost: "127.0.0.1",
-		HTTPPort: 9393,
+		HTTPPort: 0,
 		WSHost:   "127.0.0.1",
-		WSPort:   9393,
+		WSPort:   0,
 	})
 	if err != nil {
 		t.Fatalf("could not create node: %v", err)
@@ -173,11 +193,11 @@ func createNode(t *testing.T, gqlEnabled bool) *node.Node {
 	if !gqlEnabled {
 		return stack
 	}
-	createGQLService(t, stack, "127.0.0.1:9393")
+	createGQLService(t, stack)
 	return stack
 }
 
-func createGQLService(t *testing.T, stack *node.Node, endpoint string) {
+func createGQLService(t *testing.T, stack *node.Node) {
 	// create backend
 	ethConf := &eth.Config{
 		Genesis: &core.Genesis{
